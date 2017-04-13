@@ -1,20 +1,9 @@
 package org.riderzen.flume.sink;
 
-import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-
+import com.google.common.base.Throwables;
+import com.mongodb.*;
 import org.apache.commons.lang.StringUtils;
-import org.apache.flume.Channel;
-import org.apache.flume.Context;
-import org.apache.flume.Event;
-import org.apache.flume.EventDeliveryException;
-import org.apache.flume.Transaction;
+import org.apache.flume.*;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.sink.AbstractSink;
 import org.joda.time.format.DateTimeFormat;
@@ -24,16 +13,13 @@ import org.joda.time.format.DateTimeParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.mongodb.BasicDBObject;
-import com.mongodb.BasicDBObjectBuilder;
-import com.mongodb.CommandResult;
-import com.mongodb.DB;
-import com.mongodb.DBCollection;
-import com.mongodb.DBObject;
-import com.mongodb.Mongo;
-import com.mongodb.MongoException;
-import com.mongodb.WriteConcern;
-import com.mongodb.util.JSON;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * User: guoqiang.li
@@ -74,6 +60,8 @@ public class MongoSink extends AbstractSink implements Configurable {
     public static final String OP_INC = "$inc";
     public static final String OP_SET = "$set";
     public static final String OP_SET_ON_INSERT = "$setOnInsert";
+    public static final String OP_MAX = "$max";
+    public static final String CONFIG_SERIALIZER = "serializer";
 
     public static final boolean DEFAULT_AUTHENTICATION_ENABLED = false;
     public static final String DEFAULT_HOST = "localhost";
@@ -87,6 +75,7 @@ public class MongoSink extends AbstractSink implements Configurable {
     public static final char NAMESPACE_SEPARATOR = '.';
     public static final String OP_UPSERT = "upsert";
     public static final String EXTRA_FIELDS_PREFIX = "extraFields.";
+    public static final String DEFAULT_SERIALIZER = "org.riderzen.flume.sink.MongoSimpleEventSerializer";
 
     private static AtomicInteger counter = new AtomicInteger();
 
@@ -102,10 +91,11 @@ public class MongoSink extends AbstractSink implements Configurable {
     private String dbName;
     private String collectionName;
     private int batchSize;
-    private boolean autoWrap;
-    private String wrapField;
-    private String timestampField;
-    private final Map<String, String> extraInfos = new ConcurrentHashMap<String, String>();
+    boolean autoWrap;
+    String wrapField;
+    String timestampField;
+    final Map<String, String> extraInfos = new ConcurrentHashMap<String, String>();
+    private MongoEventSerializer serializer;
     @Override
     public void configure(Context context) {
         setName(NAME_PREFIX + counter.getAndIncrement());
@@ -128,8 +118,17 @@ public class MongoSink extends AbstractSink implements Configurable {
         wrapField = context.getString(WRAP_FIELD, DEFAULT_WRAP_FIELD);
         timestampField = context.getString(TIMESTAMP_FIELD, DEFAULT_TIMESTAMP_FIELD);
         extraInfos.putAll(context.getSubProperties(EXTRA_FIELDS_PREFIX));
-        logger.info("MongoSink {} context { host:{}, port:{}, authentication_enabled:{}, username:{}, password:{}, model:{}, dbName:{}, collectionName:{}, batch: {}, autoWrap: {}, wrapField: {}, timestampField: {} }",
-                new Object[]{getName(), host, port, authentication_enabled, username, password, model, dbName, collectionName, batchSize, autoWrap, wrapField, timestampField});
+        String eventSerializerType = context.getString(CONFIG_SERIALIZER, DEFAULT_SERIALIZER);
+        try {
+            Class<? extends MongoEventSerializer> clazz =
+                    Class.forName(eventSerializerType).asSubclass(MongoEventSerializer.class);
+            serializer = clazz.newInstance();
+        } catch (Exception e) {
+            logger.error("Could not instantiate event serializer.", e);
+            throw new IllegalArgumentException("Could not instantiate event serializer", e);
+        }
+        logger.info("MongoSink {} context { host:{}, port:{}, authentication_enabled:{}, username:{}, password:{}, model:{}, dbName:{}, collectionName:{}, batch: {}, autoWrap: {}, wrapField: {}, timestampField: {}, serializer: {} }",
+                new Object[]{getName(), host, port, authentication_enabled, username, password, model, dbName, collectionName, batchSize, autoWrap, wrapField, timestampField, serializer.getClass().getSimpleName()});
     }
 
     @Override
@@ -229,20 +228,20 @@ public class MongoSink extends AbstractSink implements Configurable {
 
     private Status parseEvents() throws EventDeliveryException {
         Status status = Status.READY;
-        Channel channel = getChannel();
-        Transaction tx = null;
         Map<String, List<DBObject>> eventMap = new HashMap<String, List<DBObject>>();
         Map<String, List<DBObject>> upsertMap = new HashMap<String, List<DBObject>>();
-        try {
-            tx = channel.getTransaction();
-            tx.begin();
 
+        Channel channel = getChannel();
+        Transaction tx = channel.getTransaction();
+        tx.begin();
+        try {
             for (int i = 0; i < batchSize; i++) {
                 Event event = channel.take();
                 if (event == null) {
                     status = Status.BACKOFF;
                     break;
                 } else {
+                    this.serializer.addHeaders(event);
                     String operation = event.getHeaders().get(OPERATION);
                     if (logger.isDebugEnabled()) {
                         logger.debug("event operation is {}", operation);
@@ -264,18 +263,25 @@ public class MongoSink extends AbstractSink implements Configurable {
             }
 
             tx.commit();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             logger.error("can't process events, drop it!", e);
-            if (tx != null) {
+
+            try {
                 tx.commit();// commit to drop bad event, otherwise it will enter dead loop.
+            } catch (Exception e2) {
+                logger.error("Exception in catch commit. Commit might not have been successful", e2);
             }
 
-            throw new EventDeliveryException(e);
-        } finally {
-            if (tx != null) {
-                tx.close();
+            if(e instanceof Error) {
+                Throwables.propagate(e);
+            } else {
+                throw new EventDeliveryException(e);
             }
+
+        } finally {
+            tx.close();
         }
+
         return status;
     }
 
@@ -321,11 +327,17 @@ public class MongoSink extends AbstractSink implements Configurable {
 		if (doc.keySet().contains(OP_SET_ON_INSERT)) {
 			doc_builder.add(OP_SET_ON_INSERT, doc.get(OP_SET_ON_INSERT));
 		}
+        if (doc.keySet().contains(OP_MAX)) {
+            doc_builder.add(OP_MAX, doc.get(OP_MAX));
+        }
 		doc = doc_builder.get();
 		//logger.debug("query: {}", query);
 		//logger.debug("new doc: {}", doc);
-		CommandResult result = collection.update(query, doc, true,
-				false, WriteConcern.SAFE).getLastError();
+
+		//CommandResult result = collection.update(query, doc, true, false, WriteConcern.SAFE).getLastError();
+        collection.update(query, doc, true, false, WriteConcern.SAFE);
+
+            /*
 		if (result.ok()) {
 			String errorMessage = result.getErrorMessage();
 			if (errorMessage != null) {
@@ -337,6 +349,7 @@ public class MongoSink extends AbstractSink implements Configurable {
 		} else {
 		    logger.error("can't get last error");
 		}
+		*/
 	    }
         }
     }
@@ -392,41 +405,17 @@ public class MongoSink extends AbstractSink implements Configurable {
             documents = new ArrayList<DBObject>(batchSize);
         }
 
-        DBObject eventJson;
-        byte[] body = event.getBody();
-        if (autoWrap) {
-            eventJson = new BasicDBObject(wrapField, new String(body));
-        } else {
-            try {
-                eventJson = (DBObject) JSON.parse(new String(body));
-            } catch (Exception e) {
-                logger.error("Can't parse events: " + new String(body), e);
-                return documents;
-            }
-        }
-        if (!event.getHeaders().containsKey(OPERATION) && timestampField != null) {
-            Date timestamp;
-            if (eventJson.containsField(TIMESTAMP_FIELD)) {
-                try {
-                    String dateText = (String) eventJson.get(TIMESTAMP_FIELD);
-                    timestamp = dateTimeFormatter.parseDateTime(dateText).toDate();
-                    eventJson.removeField(TIMESTAMP_FIELD);
-                } catch (Exception e) {
-                    logger.error("can't parse date ", e);
-
-                    timestamp = new Date();
+        try {
+            DBObject eventJson = this.serializer.process(this, event);
+            if (null != eventJson) {
+                for(Map.Entry<String, String> entry : this.extraInfos.entrySet()) {
+                    eventJson.put(entry.getKey(), entry.getValue());
                 }
-            } else {
-                timestamp = new Date();
+                documents.add(eventJson);
             }
-            eventJson.put(TIMESTAMP_FIELD, timestamp);
+        } catch (Exception e) {
+            logger.error("Can't parse events: " + new String(event.getBody()), e);
         }
-        
-        for(Map.Entry<String, String> entry : extraInfos.entrySet()) {
-            eventJson.put(entry.getKey(), entry.getValue());
-        }
-
-        documents.add(eventJson);
 
         return documents;
     }
